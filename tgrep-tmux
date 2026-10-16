@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# tgrep-tmux — Telegram-style search over the current tmux pane's scrollback.
+#
+# Bind in ~/.tmux.conf:
+#     bind -n C-f display-popup -E -w 90% -h 70% "$HOME/.local/bin/tgrep-tmux"
+
+set -euo pipefail
+
+if ! command -v tgrep >/dev/null 2>&1; then
+    tmux display-message "tgrep: not installed. Run: sudo ./install.sh"
+    exit 1
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+tmux capture-pane -p -S - > "$tmp"
+
+if sel="$(tgrep -p < "$tmp")"; then
+    [ -z "$sel" ] && exit 0
+
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$sel" | wl-copy
+        tmux display-message "tgrep: copied → $sel"
+    elif command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$sel" | xclip -selection clipboard
+        tmux display-message "tgrep: copied → $sel"
+    elif command -v xsel >/dev/null 2>&1; then
+        printf '%s' "$sel" | xsel --clipboard --input
+        tmux display-message "tgrep: copied → $sel"
+    else
+        tmux display-message "tgrep: $sel"
+    fi
+fi
