@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-tgrep — Telegram-style fuzzy search for the Kali terminal.
-"""
+"""tgrep v2 — one search bar for terminal text, history, and files."""
 
 import argparse
 import curses
@@ -10,28 +7,66 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.1.0"
-MAX_RESULTS = 2000
+VERSION = "2.0.0"
+MAX_PER_SOURCE = 200
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+             ".cache", "dist", "build"}
 
-HISTORY_FILES = [
-    Path.home() / ".bash_history",
-    Path.home() / ".zsh_history",
-    Path.home() / ".local/share/fish/fish_history",
-]
+
+@dataclass
+class Match:
+    src: str
+    text: str
+    raw: str
+    score: int = 0
+    pos: list = field(default_factory=list)
+
+
+def pane_id():
+    return os.environ.get("TMUX_PANE")
+
+
+def load_terminal():
+    pane = pane_id()
+    if not pane or not shutil.which("tmux"):
+        return []
+    try:
+        r = subprocess.run(["tmux", "capture-pane", "-t", pane, "-p", "-S", "-"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return []
+        out, prev = [], None
+        for line in r.stdout.splitlines():
+            line = line.rstrip()
+            if not line.strip():
+                prev = None
+                continue
+            if line == prev:
+                continue
+            out.append(line)
+            prev = line
+        return out[-10000:]
+    except Exception:
+        return []
 
 
 def load_history():
+    files = [Path.home() / ".bash_history",
+             Path.home() / ".zsh_history",
+             Path.home() / ".local/share/fish/fish_history"]
     entries = []
-    for hf in HISTORY_FILES:
-        if not hf.exists():
+    for f in files:
+        if not f.exists():
             continue
         try:
-            with open(hf, "r", errors="ignore") as f:
-                for line in f:
+            with open(f, "r", errors="ignore") as fh:
+                for line in fh:
                     line = line.rstrip("\n")
-                    if not line:
+                    if not line.strip():
                         continue
                     if line.startswith(": ") and ";" in line:
                         line = line.split(";", 1)[1]
@@ -43,34 +78,36 @@ def load_history():
         if e not in seen:
             seen.add(e)
             out.append(e)
+            if len(out) >= MAX_PER_SOURCE * 5:
+                break
     return out
 
 
-def load_files(root):
+def load_files(root="."):
     root = Path(root).expanduser().resolve()
     cwd = Path.cwd()
     out = []
-    for p in root.rglob("*"):
-        try:
-            if p.is_file():
+    try:
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")]
+            for name in fns:
+                if name.startswith("."):
+                    continue
+                p = Path(dp) / name
                 try:
                     out.append(str(p.relative_to(cwd)))
                 except ValueError:
                     out.append(str(p))
-                if len(out) >= 20000:
-                    break
-        except OSError:
-            continue
+                if len(out) >= 5000:
+                    return out
+    except OSError:
+        pass
     return out
-
-
-def load_stdin():
-    return [line.rstrip("\n") for line in sys.stdin if line.strip()]
 
 
 def fuzzy(query, text):
     if not query:
-        return 0, []
+        return (0, [])
     q, t = query.lower(), text.lower()
     qi, pos, score, last = 0, [], 0, -2
     for i, ch in enumerate(t):
@@ -86,75 +123,71 @@ def fuzzy(query, text):
     if qi != len(q):
         return None
     score -= len(t) // 60
-    return score, pos
+    return (score, pos)
 
 
-def copy_to_clipboard(text):
-    for cmd in (["wl-copy"],
-                ["xclip", "-selection", "clipboard"],
-                ["xsel", "--clipboard", "--input"]):
-        if shutil.which(cmd[0]):
-            try:
-                p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-                p.communicate(text.encode())
-                if p.returncode == 0:
-                    return True
-            except OSError:
-                continue
-    return False
+class JumpToLine(Exception):
+    def __init__(self, line):
+        self.line = line
 
 
 class App:
-    def __init__(self, stdscr, args):
+    TAGS = {'T': 2, 'H': 3, 'F': 4}
+    HINTS = {'T': "Enter: jump to this line in terminal",
+             'H': "Enter: run this command",
+             'F': "Enter: open this file"}
+
+    def __init__(self, stdscr, args, term_lines):
         self.stdscr = stdscr
-        self.args = args
-        if args.pipe:
-            self.mode = "pipe"
-        elif args.files:
-            self.mode = "files"
-        else:
-            self.mode = "history"
-        self.entries = []
+        self.term_lines = term_lines
+        self.history = [] if args.no_hist else load_history()
+        self.files = [] if args.no_files else load_files(args.directory)
         self.query = args.query or ""
         self.results = []
         self.cursor = 0
         self.offset = 0
         self.status = ""
+
         self.colors = curses.has_colors()
         if self.colors:
             curses.start_color()
             try:
                 curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_YELLOW, -1)
+                curses.init_pair(1, curses.COLOR_RED, -1)
                 curses.init_pair(2, curses.COLOR_CYAN, -1)
-                curses.init_pair(3, curses.COLOR_GREEN, -1)
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)
+                curses.init_pair(4, curses.COLOR_BLUE, -1)
+                curses.init_pair(5, curses.COLOR_GREEN, -1)
             except curses.error:
                 self.colors = False
-        self.reload()
+        self.refresh()
 
-    def reload(self):
-        if self.mode == "history":
-            self.entries = load_history()
-        elif self.mode == "pipe":
-            self.entries = load_stdin()
-        else:
-            self.entries = load_files(self.args.directory or ".")
-        self.refresh_results()
-
-    def refresh_results(self):
+    def refresh(self):
         q = self.query.strip()
-        if not q:
-            self.results = [(0, e, []) for e in self.entries[:MAX_RESULTS]]
-        else:
-            scored = []
-            for e in self.entries:
-                m = fuzzy(q, e)
-                if m:
-                    scored.append((m[0], e, m[1]))
-            scored.sort(key=lambda x: (-x[0], len(x[1])))
-            self.results = scored[:MAX_RESULTS]
+        prefix = None
+        if len(q) >= 2 and q[1] == ':' and q[0].lower() in "thf":
+            prefix = q[0].upper()
+            q = q[2:]
+
+        matches = []
+        for src, items in [('T', self.term_lines),
+                           ('H', self.history),
+                           ('F', self.files)]:
+            if not items or (prefix and prefix != src):
+                continue
+            if not q:
+                for text in items[:MAX_PER_SOURCE]:
+                    matches.append(Match(src, text, text))
+            else:
+                scored = []
+                for text in items:
+                    m = fuzzy(q, text)
+                    if m is not None:
+                        scored.append(Match(src, text, text, m[0], m[1]))
+                scored.sort(key=lambda x: (-x.score, len(x.text)))
+                matches.extend(scored[:MAX_PER_SOURCE])
+        matches.sort(key=lambda m: -m.score)
+        self.results = matches
         self.cursor = 0
         self.offset = 0
 
@@ -162,83 +195,120 @@ class App:
         s = self.stdscr
         s.erase()
         h, w = s.getmaxyx()
-        if h < 4 or w < 20:
+        if h < 5 or w < 40:
             s.refresh()
             return
-        title = f" tgrep v{VERSION}  ·  {self.mode} "
+
+        counts = {k: sum(1 for m in self.results if m.src == k) for k in "THF"}
+        note = "" if pane_id() else "  (not in tmux — T off)"
+        title = f" tgrep v{VERSION}  ·  T:{counts['T']}  H:{counts['H']}  F:{counts['F']}{note} "
         s.addstr(0, 0, title[:w - 1].ljust(w - 1), curses.A_REVERSE)
-        prompt = " Search: "
-        s.addstr(1, 0, prompt, curses.A_BOLD)
-        qx = len(prompt)
-        avail = max(1, w - qx - 2)
-        qtext = self.query[-avail:]
+
+        s.addstr(1, 0, " Search: ", curses.A_BOLD)
+        qx = 9
+        qtext = self.query[-(w - qx - 2):]
         try:
             s.addstr(1, qx, qtext)
             s.move(1, qx + len(qtext))
         except curses.error:
             pass
         try:
-            s.addstr(2, 0, "─" * (w - 1))
+            s.addstr(2, 0, "─" * (w - 1), curses.A_DIM)
         except curses.error:
             pass
+
         top = 3
-        list_h = max(1, h - top - 1)
+        list_h = h - top - 2
         if self.cursor < self.offset:
             self.offset = self.cursor
         if self.cursor >= self.offset + list_h:
             self.offset = self.cursor - list_h + 1
+
         if not self.results:
             try:
-                s.addstr(top + 1, 2, "  (no matches)", curses.A_DIM)
+                s.addstr(top, 2, "(no matches)", curses.A_DIM)
             except curses.error:
                 pass
+
         for i in range(list_h):
             idx = self.offset + i
             if idx >= len(self.results):
                 break
-            _, text, pos = self.results[idx]
+            m = self.results[idx]
             y = top + i
-            selected = (idx == self.cursor)
-            base = curses.A_REVERSE if selected else 0
-            num = f"{idx + 1:>5} "
+            sel = (idx == self.cursor)
+            base = curses.A_REVERSE if sel else 0
+
+            tag = f" {m.src} "
+            tag_attr = (base | curses.A_BOLD) if sel or not self.colors \
+                else curses.color_pair(self.TAGS[m.src]) | curses.A_BOLD
             try:
-                s.addstr(y, 0, num, base | (0 if selected else curses.A_DIM))
+                s.addstr(y, 0, tag, tag_attr)
             except curses.error:
-                pass
-            self._draw_line(y, len(num), text, pos, base,
-                            w - len(num) - 1, selected)
+                continue
+
+            pos_set = set(m.pos)
+            maxw = w - 4
+            for j, ch in enumerate(m.text):
+                if j >= maxw:
+                    break
+                attr = base
+                if j in pos_set:
+                    attr = (base | curses.A_BOLD) if sel else \
+                           (curses.color_pair(1) | curses.A_BOLD if self.colors
+                            else curses.A_BOLD | curses.A_UNDERLINE)
+                try:
+                    s.addstr(y, 3 + j, ch, attr)
+                except curses.error:
+                    break
+
         if self.status:
-            status = f" {self.status} "
+            footer = f" {self.status} "
             self.status = ""
         else:
-            status = (f" {len(self.results)}/{len(self.entries)}  "
-                      f"↑↓ move  Enter select  Ctrl+Y copy  "
-                      f"Ctrl+E exec  Ctrl+F mode  Esc quit ")
+            hint = self.HINTS[self.results[self.cursor].src] if self.results else ""
+            footer = (f" {len(self.results)} results   ↑↓ move   {hint}   "
+                      f"t:/h:/f: filter   Esc quit ")
         try:
-            s.addstr(h - 1, 0, status[:w - 1].ljust(w - 1), curses.A_REVERSE)
+            s.addstr(h - 1, 0, footer[:w - 1].ljust(w - 1), curses.A_REVERSE)
         except curses.error:
             pass
         s.refresh()
 
-    def _draw_line(self, y, x, text, positions, base, maxw, selected):
-        if maxw <= 0:
+    def _suspend(self):
+        curses.def_prog_mode()
+        curses.endwin()
+
+    def _resume(self):
+        curses.reset_prog_mode()
+        self.stdscr.redrawwin()
+        self.stdscr.refresh()
+
+    def act(self):
+        if not self.results:
             return
-        pos_set = set(positions)
-        for i, ch in enumerate(text):
-            if i >= maxw:
-                break
-            attr = base
-            if i in pos_set:
-                if selected:
-                    attr = base | curses.A_BOLD
-                elif self.colors:
-                    attr = curses.color_pair(1) | curses.A_BOLD
-                else:
-                    attr = curses.A_BOLD | curses.A_UNDERLINE
+        m = self.results[self.cursor]
+        if m.src == 'T':
+            raise JumpToLine(m.raw)
+        if m.src == 'H':
+            self._suspend()
             try:
-                self.stdscr.addstr(y, x + i, ch, attr)
-            except curses.error:
-                break
+                subprocess.run(["bash", "-c", m.raw])
+                try:
+                    input("\nPress Enter to return to tgrep…")
+                except EOFError:
+                    pass
+            finally:
+                self.term_lines = load_terminal()
+                self._resume()
+                self.refresh()
+        elif m.src == 'F':
+            self._suspend()
+            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+            try:
+                subprocess.run([editor, m.raw])
+            finally:
+                self._resume()
 
     def run(self):
         try:
@@ -251,11 +321,11 @@ class App:
             try:
                 ch = self.stdscr.getch()
             except KeyboardInterrupt:
-                return None, None
-            if ch == -1 or ch == curses.KEY_RESIZE:
+                return
+            if ch in (-1, curses.KEY_RESIZE):
                 continue
             if ch in (27, 3):
-                return None, None
+                return
             elif ch == curses.KEY_UP:
                 if self.cursor > 0:
                     self.cursor -= 1
@@ -265,8 +335,7 @@ class App:
             elif ch == curses.KEY_PPAGE:
                 self.cursor = max(0, self.cursor - 10)
             elif ch == curses.KEY_NPAGE:
-                self.cursor = min(max(0, len(self.results) - 1),
-                                  self.cursor + 10)
+                self.cursor = min(max(0, len(self.results) - 1), self.cursor + 10)
             elif ch == curses.KEY_HOME:
                 self.cursor = 0
             elif ch == curses.KEY_END:
@@ -274,65 +343,51 @@ class App:
             elif ch in (curses.KEY_BACKSPACE, 127, 8):
                 if self.query:
                     self.query = self.query[:-1]
-                    self.refresh_results()
+                    self.refresh()
             elif ch == 21:
-                if self.query:
-                    self.query = ""
-                    self.refresh_results()
-            elif ch == 25:
-                if self.results:
-                    txt = self.results[self.cursor][1]
-                    ok = copy_to_clipboard(txt)
-                    self.status = "✓ copied!" if ok else "clipboard tool not found"
-            elif ch == 5:
-                if self.results:
-                    return "exec", self.results[self.cursor][1]
-            elif ch == 6:
-                if self.mode == "pipe":
-                    self.status = "cannot toggle mode in pipe mode"
-                else:
-                    self.mode = "files" if self.mode == "history" else "history"
-                    self.query = ""
-                    self.reload()
+                self.query = ""
+                self.refresh()
             elif ch in (10, 13, curses.KEY_ENTER):
-                if self.results:
-                    return "print", self.results[self.cursor][1]
+                self.act()
             elif 32 <= ch < 127:
                 self.query += chr(ch)
-                self.refresh_results()
+                self.refresh()
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        prog="tgrep",
-        description="Telegram-style fuzzy search for the Kali terminal.",
-    )
-    ap.add_argument("query", nargs="?", default="", help="initial query")
-    ap.add_argument("-f", "--files", action="store_true",
-                    help="search files instead of shell history")
-    ap.add_argument("-d", "--directory", default=".",
-                    help="directory to search in files mode (default: .)")
-    ap.add_argument("-p", "--pipe", action="store_true",
-                    help="read lines from stdin (pipe mode)")
-    ap.add_argument("-v", "--version", action="version",
-                    version=f"tgrep {VERSION}")
+    ap = argparse.ArgumentParser(prog="tgrep",
+        description="One search bar for terminal text, history, and files.")
+    ap.add_argument("query", nargs="?", default="")
+    ap.add_argument("-d", "--directory", default=".")
+    ap.add_argument("--no-hist", action="store_true")
+    ap.add_argument("--no-files", action="store_true")
+    ap.add_argument("-v", "--version", action="version", version=f"tgrep {VERSION}")
     args = ap.parse_args()
-    if args.pipe:
-        if sys.stdin.isatty():
-            print("tgrep: -p requires input on stdin", file=sys.stderr)
-            return 1
-    elif not sys.stdout.isatty():
+
+    if not sys.stdout.isatty():
         print("tgrep: interactive mode requires a TTY", file=sys.stderr)
         return 1
+
+    term_lines = load_terminal()
     try:
-        action, value = curses.wrapper(lambda s: App(s, args).run())
+        curses.wrapper(lambda s: App(s, args, term_lines).run())
+    except JumpToLine as jmp:
+        pane = pane_id()
+        if not pane:
+            return 1
+        time.sleep(0.05)
+        subprocess.run(["tmux", "copy-mode", "-t", pane], check=False)
+        ok = subprocess.run(
+            ["tmux", "send-keys", "-t", pane, "-X",
+             "search-backward-text", jmp.line],
+            capture_output=True, check=False).returncode == 0
+        if not ok:
+            import re
+            subprocess.run(["tmux", "send-keys", "-t", pane, "-X",
+                            "search-backward", re.escape(jmp.line)], check=False)
+        return 0
     except KeyboardInterrupt:
         return 130
-    if action == "print" and value:
-        print(value)
-    elif action == "exec" and value:
-        print(f"[tgrep] $ {value}", file=sys.stderr)
-        os.execvp("bash", ["bash", "-c", value])
     return 0
 
 
